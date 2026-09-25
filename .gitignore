@@ -1,0 +1,6 @@
+config.env
+.env
+inbounds/*.json
+!inbounds/*.json.example
+servers/
+*.log

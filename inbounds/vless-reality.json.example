@@ -1,0 +1,10 @@
+{
+  "remark": "reality-vision", "enable": true, "listen": "", "port": 443, "protocol": "vless",
+  "settings": { "decryption": "none", "fallbacks": [],
+    "clients": [{ "id": "__PASTE_UUID__", "email": "phone", "flow": "xtls-rprx-vision", "enable": true }] },
+  "streamSettings": { "network": "tcp", "security": "reality",
+    "realitySettings": { "show": false, "xver": 0, "target": "__DEST__", "serverNames": ["__SNI__"],
+      "privateKey": "__PASTE_PRIVATE_KEY__", "shortIds": ["__PASTE_SHORT_ID__"],
+      "settings": { "publicKey": "__PASTE_PUBLIC_KEY__", "fingerprint": "chrome", "spiderX": "/" } } },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true }
+}
