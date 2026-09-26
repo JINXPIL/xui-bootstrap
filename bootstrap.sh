@@ -22,7 +22,8 @@ trap 'die "Упало на строке $LINENO: $BASH_COMMAND"' ERR
 # shellcheck source=/dev/null
 . "$DIR/config.env"
 MASK_MODE=${MASK_MODE:-reality}; BLOCK_RU=${BLOCK_RU:-1}; ENABLE_BBR=${ENABLE_BBR:-1}
-SSH_KEYS_ONLY=${SSH_KEYS_ONLY:-0}; XUI_VERSION=${XUI_VERSION:-}; XRAY_VERSION=${XRAY_VERSION:-}
+SSH_KEYS_ONLY=${SSH_KEYS_ONLY:-0}; PANEL_PUBLIC=${PANEL_PUBLIC:-0}
+XUI_VERSION=${XUI_VERSION:-}; XRAY_VERSION=${XRAY_VERSION:-}
 shopt -s nullglob; TEMPLATES=("$DIR"/inbounds/*.json); shopt -u nullglob
 (( ${#TEMPLATES[@]} )) || die "В inbounds/ нет *.json"
 
@@ -74,9 +75,10 @@ ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
 for p in "${SSH_PORTS[@]}"; do ufw allow "$p/tcp" comment ssh >/dev/null; done
 for p in "${TCP_PORTS[@]}" ${EXTRA_TCP_PORTS:-}; do ufw allow "$p/tcp" comment xray >/dev/null; done
 for p in "${UDP_PORTS[@]}" ${EXTRA_UDP_PORTS:-}; do ufw allow "$p/udp" comment xray >/dev/null; done
+ufw allow 2096/tcp comment "xui-sub" >/dev/null 2>&1 || true
 if [[ $MASK_MODE == selfsteal ]]; then ufw allow 80/tcp comment acme >/dev/null; fi
 ufw --force enable >/dev/null
-ok "Фаервол: снаружи только SSH (${SSH_PORTS[*]}) и порты инбаундов"
+ok "Фаервол: SSH (${SSH_PORTS[*]}), порты инбаундов и подписка"
 
 printf '[sshd]\nenabled = true\nbackend = systemd\nport = %s\nmaxretry = 5\nbantime = 1h\n' \
   "$(IFS=,; echo "${SSH_PORTS[*]}")" > /etc/fail2ban/jail.d/xui-sshd.local
@@ -166,29 +168,61 @@ else
   curl -fsSL https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh -o /tmp/xui-install.sh
   XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none bash /tmp/xui-install.sh ${XUI_VERSION:+"$XUI_VERSION"} </dev/null
 fi
-"$XUI_BIN" setting -listenIP 127.0.0.1 >/dev/null || true
+
+if [[ $PANEL_PUBLIC == 1 ]]; then
+  "$XUI_BIN" setting -listenIP 0.0.0.0 >/dev/null || true
+else
+  "$XUI_BIN" setting -listenIP 127.0.0.1 >/dev/null || true
+fi
+
 TOKEN=$("$XUI_BIN" setting -getApiToken -tokenName xui-bootstrap 2>/dev/null | awk '/^apiToken:/{print $2}' || true)
 [[ -n $TOKEN ]] || die "x-ui не выдал API-токен (убедитесь, что установлена актуальная версия 3x-ui)"
 systemctl restart x-ui
+
 SHOW=$("$XUI_BIN" setting -show)
 PANEL_PORT=$(awk '$1=="port:"{print $2}' <<<"$SHOW")
 WBP=$(awk '$1=="webBasePath:"{print $2}' <<<"$SHOW"); WBP="/${WBP#/}"; WBP="${WBP%/}/"
 if grep -qi "SSL" <<<"$SHOW"; then SCHEME="https"; else SCHEME="http"; fi
 BASE="$SCHEME://127.0.0.1:$PANEL_PORT$WBP"
+
+if [[ $PANEL_PUBLIC == 1 ]]; then
+  ufw allow "$PANEL_PORT/tcp" comment "xui-panel" >/dev/null 2>&1 || true
+fi
+
 api() { local m=$1 p=$2; shift 2; curl -k -sS --max-time 180 -X "$m" -H "Authorization: Bearer $TOKEN" "$@" "$BASE$p"; }
 for i in $(seq 1 40); do
   if api GET panel/api/server/status 2>/dev/null | jq -e '.success' >/dev/null 2>&1; then break; fi
   (( i < 40 )) || die "API панели не ответило (journalctl -u x-ui)"; sleep 1
 done
-ok "Панель прибита к 127.0.0.1:$PANEL_PORT, API работает"
+
+if [[ $PANEL_PUBLIC == 1 ]]; then
+  ok "Панель доступна снаружи на порту $PANEL_PORT, API работает"
+else
+  ok "Панель прибита к 127.0.0.1:$PANEL_PORT, API работает"
+fi
 
 if [[ -n $XRAY_VERSION ]]; then
   if api POST "panel/api/server/installXray/$XRAY_VERSION" | jq -e '.success' >/dev/null; then ok "Xray → $XRAY_VERSION"
   else warn "Не поставил Xray $XRAY_VERSION"; fi
 fi
 
-# ---------- 8. импорт инбаундов ----------
-EXIST=$(api GET panel/api/inbounds/list | jq -r '.obj[]?.port')
+# ---------- 8. импорт инбаундов и синхронизация UFW ----------
+EXIST_INBOUNDS=$(api GET panel/api/inbounds/list 2>/dev/null | jq -c '.obj[]?' || true)
+EXIST_PORTS=$(jq -r '.port // empty' <<<"$EXIST_INBOUNDS" 2>/dev/null || true)
+
+# Синхронизируем уже существующие инбаунды с фаерволом (чтобы ничего не отваливалось)
+while IFS= read -r item; do
+  [[ -z $item ]] && continue
+  ep=$(jq -r '.port // empty' <<<"$item")
+  epr=$(jq -r '.protocol // empty' <<<"$item")
+  enet=$(jq -r '.streamSettings | (if type=="string" then (fromjson? // {}) else (. // {}) end) | .network // "tcp"' <<<"$item")
+  [[ -z $ep ]] && continue
+  case "$epr:$enet" in
+    hysteria*|tuic*|wireguard*|amneziawg*|*:kcp) ufw allow "$ep/udp" comment "xray-existing" >/dev/null 2>&1 || true ;;
+    *) ufw allow "$ep/tcp" comment "xray-existing" >/dev/null 2>&1 || true ;;
+  esac
+done <<< "$EXIST_INBOUNDS"
+
 TMP=$(mktemp)
 cleanup() { rm -f "$TMP"; }
 trap cleanup EXIT
@@ -197,7 +231,7 @@ for f in "${TEMPLATES[@]}"; do
   render "$f" | jq -c 'del(.id,.nodeId,.originNodeGuid,.fallbackParent) | .up=0 | .down=0
                        | .clientStats = ((.clientStats // []) | map(.up=0 | .down=0))' > "$TMP"
   p=$(jq -r .port "$TMP")
-  if grep -qx "$p" <<<"$EXIST"; then warn "$n: порт $p уже занят — пропускаю"; continue; fi
+  if grep -qx "$p" <<<"$EXIST_PORTS"; then warn "$n: порт $p уже занят — пропускаю"; continue; fi
   r=$(api POST panel/api/inbounds/import --data-urlencode "data@$TMP")
   jq -e '.success' >/dev/null <<<"$r" || die "$n: панель отказала: $(jq -r '.msg // .' <<<"$r")"
   ok "$n → порт $p"
@@ -205,14 +239,17 @@ done
 
 # ---------- 9. роутинг: RU режем на сервере ----------
 if [[ $BLOCK_RU == 1 ]]; then
-  api POST panel/api/xray/ | jq -c '(.obj | if type=="string" then (fromjson? // {}) else (. // {}) end) | .xraySetting
+  BLOCK_TAG=$(api POST panel/api/xray/ 2>/dev/null | jq -r '(.obj | if type=="string" then (fromjson? // {}) else (. // {}) end) | .xraySetting.outbounds[]? | select(.protocol=="blackhole") | .tag' 2>/dev/null | head -n1 || true)
+  BLOCK_TAG=${BLOCK_TAG:-blocked}
+
+  api POST panel/api/xray/ | jq -c --arg btag "$BLOCK_TAG" '(.obj | if type=="string" then (fromjson? // {}) else (. // {}) end) | .xraySetting
     | if any(.routing.rules[]?; (.ip // []) | any(.[]; . == "geoip:ru")) then . else
       .routing.rules = ([.routing.rules[] | select(.outboundTag == "api")]
-        + [{"type":"field","outboundTag":"blocked","ip":["geoip:ru"]},
-           {"type":"field","outboundTag":"blocked","domain":["geosite:category-ru","domain:ru","domain:su","domain:xn--p1ai"]}]
+        + [{"type":"field","outboundTag":$btag,"ip":["geoip:ru"]},
+           {"type":"field","outboundTag":$btag,"domain":["geosite:category-ru","domain:ru","domain:su","domain:xn--p1ai"]}]
         + [.routing.rules[] | select(.outboundTag != "api")]) end' > "$TMP" || true
   if [[ -s $TMP ]] && api POST panel/api/xray/update --data-urlencode "xraySetting@$TMP" | jq -e '.success' >/dev/null; then
-    ok "Роутинг: трафик к RU режется на сервере"; else warn "Роутинг не обновился"; fi
+    ok "Роутинг: трафик к RU режется на сервере ($BLOCK_TAG)"; else warn "Роутинг не обновился"; fi
 fi
 
 # ---------- 10. итог ----------
@@ -225,9 +262,15 @@ LINKS=$(api GET panel/api/inbounds/allLinks -H "Host: $PUBLIC_HOST" 2>/dev/null 
 {
   echo "=== $PUBLIC_HOST ($SERVER_IP) — $(date -u '+%F %H:%M') UTC ==="
   echo "Маска: $MASK_MODE | SNI: $SNI | dest: $DEST | Xray: ${XRAY_VER:-?}"
-  echo; echo "Панель (только через туннель):"
-  echo "  ssh -N -L 2222:127.0.0.1:$PANEL_PORT -p ${SSH_PORTS[0]} root@$SERVER_IP"
-  echo "  $SCHEME://127.0.0.1:2222$WBP   ${U:+логин: $U  пароль: $P}"
+  echo
+  if [[ $PANEL_PUBLIC == 1 ]]; then
+    echo "Панель (прямой доступ):"
+    echo "  $SCHEME://$PUBLIC_HOST:$PANEL_PORT$WBP   ${U:+логин: $U  пароль: $P}"
+  else
+    echo "Панель (только через туннель):"
+    echo "  ssh -N -L 2222:127.0.0.1:$PANEL_PORT -p ${SSH_PORTS[0]} root@$SERVER_IP"
+    echo "  $SCHEME://127.0.0.1:2222$WBP   ${U:+логин: $U  пароль: $P}"
+  fi
   echo; echo "Ссылки:"; echo "${LINKS:-(не получил — возьми в панели)}"
 } > "$RESULT"; chmod 600 "$RESULT"; cat "$RESULT"
 ok "Готово"
