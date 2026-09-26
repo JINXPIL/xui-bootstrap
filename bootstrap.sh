@@ -173,8 +173,9 @@ systemctl restart x-ui
 SHOW=$("$XUI_BIN" setting -show)
 PANEL_PORT=$(awk '$1=="port:"{print $2}' <<<"$SHOW")
 WBP=$(awk '$1=="webBasePath:"{print $2}' <<<"$SHOW"); WBP="/${WBP#/}"; WBP="${WBP%/}/"
-BASE="http://127.0.0.1:$PANEL_PORT$WBP"
-api() { local m=$1 p=$2; shift 2; curl -sS --max-time 180 -X "$m" -H "Authorization: Bearer $TOKEN" "$@" "$BASE$p"; }
+if grep -qi "SSL" <<<"$SHOW"; then SCHEME="https"; else SCHEME="http"; fi
+BASE="$SCHEME://127.0.0.1:$PANEL_PORT$WBP"
+api() { local m=$1 p=$2; shift 2; curl -k -sS --max-time 180 -X "$m" -H "Authorization: Bearer $TOKEN" "$@" "$BASE$p"; }
 for i in $(seq 1 40); do
   if api GET panel/api/server/status 2>/dev/null | jq -e '.success' >/dev/null 2>&1; then break; fi
   (( i < 40 )) || die "API панели не ответило (journalctl -u x-ui)"; sleep 1
@@ -226,7 +227,7 @@ LINKS=$(api GET panel/api/inbounds/allLinks -H "Host: $PUBLIC_HOST" 2>/dev/null 
   echo "Маска: $MASK_MODE | SNI: $SNI | dest: $DEST | Xray: ${XRAY_VER:-?}"
   echo; echo "Панель (только через туннель):"
   echo "  ssh -N -L 2222:127.0.0.1:$PANEL_PORT -p ${SSH_PORTS[0]} root@$SERVER_IP"
-  echo "  http://127.0.0.1:2222$WBP   ${U:+логин: $U  пароль: $P}"
+  echo "  $SCHEME://127.0.0.1:2222$WBP   ${U:+логин: $U  пароль: $P}"
   echo; echo "Ссылки:"; echo "${LINKS:-(не получил — возьми в панели)}"
 } > "$RESULT"; chmod 600 "$RESULT"; cat "$RESULT"
 ok "Готово"
