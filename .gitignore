@@ -5,3 +5,6 @@ inbounds/*.json
 servers/
 site/
 *.log
+# автозагрузки чата desktop-приложения, если папка выбрана как папка загрузок
+Claude outputs/
+xui-bootstrap-fixed.*
