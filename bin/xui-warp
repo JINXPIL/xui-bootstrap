@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# xui-warp — управление WARP-аутбаундом Cloudflare для xui-bootstrap.
+#   register  — зарегистрировать новый WARP-девайс (пишет warp.env)
+#   rotate    — сменить IP (новая регистрация) и обновить outbound в панели
+#   health    — проверить доступность Gemini через WARP; при провале — rotate
+# Запускается вручную или таймером xui-warp.timer.
+set -Eeuo pipefail
+
+LIB=/usr/local/share/xui-bootstrap/lib
+for m in common keys xui warp; do
+  # shellcheck source=/dev/null
+  [[ -r "$LIB/$m.sh" ]] && . "$LIB/$m.sh"
+done
+command -v is_json >/dev/null 2>&1 || { echo "xui-warp: библиотеки не установлены ($LIB)"; exit 1; }
+
+cmd="${1:-health}"
+case "$cmd" in
+  register)
+    warp_register && ok "WARP: регистрация выполнена ($WARP_ENV)" || { warn "WARP: регистрация не удалась"; exit 1; }
+    ;;
+  rotate)
+    info "WARP: ротация IP…"
+    warp_register || { warn "WARP: не смог перерегистрироваться"; exit 1; }
+    warp_swap_in_template && ok "WARP: IP сменён, панель обновлена" || { warn "WARP: не обновил панель"; exit 1; }
+    ;;
+  health)
+    if warp_health; then
+      ok "WARP: Gemini доступен"
+    else
+      rc=$?
+      if [[ $rc == 2 ]]; then warn "WARP: проверку выполнить не удалось (нет xray/creds)"; exit 0; fi
+      warn "WARP: Gemini недоступен — ротирую IP"
+      warp_register && warp_swap_in_template && ok "WARP: IP сменён после провала health" || warn "WARP: ротация не удалась"
+    fi
+    ;;
+  *)
+    echo "usage: xui-warp {register|rotate|health}"; exit 2 ;;
+esac
