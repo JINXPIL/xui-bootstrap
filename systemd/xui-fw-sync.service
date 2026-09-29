@@ -1,0 +1,12 @@
+[Unit]
+Description=xui-bootstrap firewall sync (opens ports for panel inbounds)
+After=x-ui.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xui-fw-sync
+Nice=10
+# лёгкая изоляция: демону нужен только ufw/nft/curl/x-ui
+ProtectHome=yes
+NoNewPrivileges=yes

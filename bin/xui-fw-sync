@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# xui-fw-sync — приводит UFW в соответствие со списком инбаундов в панели.
+#
+# Зачем: 3x-ui сам НЕ открывает порты в фаерволе. Любой инбаунд, добавленный
+# в UI после установки (Hysteria2, TUIC, WireGuard, второй VLESS и т.д.),
+# остаётся закрытым снаружи и уходит в таймаут. Демон каждые пару минут читает
+# список инбаундов через локальное API и открывает ровно нужные порты
+# (TCP/UDP по протоколу и транспорту), а порты удалённых инбаундов — закрывает.
+#
+# Запускается systemd-таймером xui-fw-sync.timer. Никаких аргументов.
+set -Eeuo pipefail
+
+XUI_BIN=${XUI_BIN:-/usr/local/x-ui/x-ui}
+LOG_TAG=xui-fw-sync
+log() { logger -t "$LOG_TAG" -- "$*" 2>/dev/null || printf '%s\n' "$*"; }
+
+command -v ufw  >/dev/null || { log "ufw не установлен"; exit 0; }
+command -v jq   >/dev/null || { log "jq не установлен";  exit 0; }
+command -v curl >/dev/null || { log "curl не установлен"; exit 0; }
+[[ -x $XUI_BIN ]] || { log "x-ui не найден"; exit 0; }
+
+# --- токен и адрес локального API ---
+TOKEN=$("$XUI_BIN" setting -getApiToken -tokenName xui-bootstrap 2>/dev/null | awk '/^apiToken:/{print $2}' || true)
+[[ -n $TOKEN ]] || { log "нет API-токена — пропуск"; exit 0; }
+
+SHOW=$("$XUI_BIN" setting -show 2>/dev/null || true)
+PORT=$(awk '$1=="port:"{print $2}' <<<"$SHOW")
+WBP=$(awk '$1=="webBasePath:"{print $2}' <<<"$SHOW"); WBP="/${WBP#/}"; WBP="${WBP%/}/"
+grep -qi 'SSL' <<<"$SHOW" && SCHEME=https || SCHEME=http
+BASE="$SCHEME://127.0.0.1:$PORT$WBP"
+
+api() { curl -k -sS --max-time 60 -H "Authorization: Bearer $TOKEN" "$BASE$1"; }
+
+LIST=$(api panel/api/inbounds/list 2>/dev/null || true)
+jq -e '.success' >/dev/null 2>&1 <<<"$LIST" || { log "API не ответило — пропуск"; exit 0; }
+
+# --- желаемое множество портов: "port/proto" для включённых инбаундов ---
+declare -A WANT=()
+while IFS= read -r item; do
+  [[ -z $item ]] && continue
+  en=$(jq -r '.enable // true' <<<"$item")
+  [[ $en == true ]] || continue
+  port=$(jq -r '.port // empty' <<<"$item"); [[ -n $port ]] || continue
+  proto=$(jq -r '.protocol // ""' <<<"$item")
+  net=$(jq -r '(.streamSettings | if type=="string" then (fromjson? // {}) else (.//{}) end).network // "tcp"' <<<"$item")
+  case "$proto:$net" in
+    hysteria*|tuic*|wireguard*|amneziawg*|*:kcp|*:hysteria) WANT["$port/udp"]=1 ;;
+    *)
+      WANT["$port/tcp"]=1
+      # shadowsocks с network содержащим udp — слушает и UDP
+      if [[ $proto == shadowsocks ]]; then
+        ssnet=$(jq -r '(.settings | if type=="string" then (fromjson? // {}) else (.//{}) end).network // "tcp,udp"' <<<"$item")
+        [[ $ssnet == *udp* ]] && WANT["$port/udp"]=1
+      fi
+      ;;
+  esac
+done < <(jq -c '.obj[]?' <<<"$LIST")
+
+# доп. порты из окружения (EXTRA_*_PORTS), если демон их получил
+for p in ${EXTRA_TCP_PORTS:-}; do WANT["$p/tcp"]=1; done
+for p in ${EXTRA_UDP_PORTS:-}; do WANT["$p/udp"]=1; done
+
+# --- что уже открыто нами (комментарий xui-sync) ---
+declare -A HAVE=()
+while IFS= read -r line; do
+  # формат: "2096/udp   ALLOW IN  Anywhere  # xui-sync"
+  pp=$(grep -oE '^[0-9]+/(tcp|udp)' <<<"$line" || true)
+  [[ -n $pp ]] && HAVE["$pp"]=1
+done < <(ufw status | grep -F '# xui-sync' || true)
+
+changed=0
+# открыть недостающие
+for pp in "${!WANT[@]}"; do
+  if [[ -z ${HAVE[$pp]:-} ]]; then
+    ufw allow "${pp%/*}/${pp#*/}" comment 'xui-sync' >/dev/null 2>&1 && { log "открыт $pp"; changed=1; }
+  fi
+done
+# закрыть лишние (порты удалённых инбаундов)
+for pp in "${!HAVE[@]}"; do
+  if [[ -z ${WANT[$pp]:-} ]]; then
+    ufw delete allow "${pp%/*}/${pp#*/}" >/dev/null 2>&1 && { log "закрыт $pp"; changed=1; }
+  fi
+done
+
+[[ $changed == 1 ]] && log "синхронизация завершена (изменения применены)" || true
+exit 0
