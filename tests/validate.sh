@@ -307,7 +307,7 @@ grep -q 'kill -HUP "$p"' lib/ssl.sh && ! grep -q 'reloadcmd "systemctl restart x
 grep -q '^XUI_ACME_DAYS_IP=4' lib/ssl.sh && pass "IP-серт продлевается на ~3-и сутки (было ~5-е)" || bad "интервал продления IP-серта"
 
 echo "== 9. Поведенческие тесты =="
-for t in warp_test ssl_test idempotency_test xray_test mihomo_test; do
+for t in warp_test ssl_test idempotency_test update_test xray_test mihomo_test; do
   if bash "tests/$t.sh" >"/tmp/.$t.log" 2>&1; then
     if grep -q 'пропуск' "/tmp/.$t.log" && ! grep -q PASS "/tmp/.$t.log"; then note "$t: $(tail -n1 "/tmp/.$t.log")"
     else pass "$t.sh: $(grep -c PASS "/tmp/.$t.log") проверок"; fi
