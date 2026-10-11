@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  xui-update — безопасное обновление компонентов 3x-ui.
+#
+#    xui-update geodata      обновить geoip/geosite (списки РФ/обхода). Безопасно.
+#    xui-update check [TAG]  проверить, примет ли НОВОЕ ядро Xray (по умолчанию —
+#                            последний релиз) текущий конфиг панели. Ничего не
+#                            меняет; показывает устаревшие/удалённые функции.
+#    xui-update core         обновить ядро Xray: сначала та же проверка на живом
+#                            конфиге, потом установка, контроль запуска и откат.
+#    xui-update all          geodata, затем core.
+#
+#  Запускается systemd-таймерами (xui-geodata.timer / xui-core.timer) или вручную.
+#  Логи — в stderr → видны в `journalctl -u xui-geodata -u xui-core`.
+# ============================================================================
+set -Eeuo pipefail
+
+LIB=/usr/local/share/xui-bootstrap/lib
+for m in common xui; do
+  # shellcheck source=/dev/null
+  [[ -r "$LIB/$m.sh" ]] && . "$LIB/$m.sh"
+done
+command -v jq   >/dev/null 2>&1 || { echo "xui-update: нужен jq"   >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "xui-update: нужен curl" >&2; exit 1; }
+type -t ok >/dev/null 2>&1 || { echo "xui-update: нет lib/common.sh" >&2; exit 1; }
+
+XUI_DIR=${XUI_DIR:-/usr/local/x-ui}
+XRAY_REPO=${XRAY_REPO:-XTLS/Xray-core}
+
+_need_api() {
+  [[ -n ${BASE:-} ]] && return 0
+  xui_api_connect xui-update || { warn "xui-update: API панели недоступно — пропускаю"; return 1; }
+}
+
+# ---------------------------------------------------------------------------
+# geodata — ТОЛЬКО через штатный API панели (тот же источник, что у панели:
+# имена категорий geosite:category-ru, geoip:ru и т.п. не разъедутся с правилами).
+# ---------------------------------------------------------------------------
+update_geodata() {
+  _need_api || return 0
+  info "Обновляю geodata (geoip/geosite) через панель…"
+  if api POST panel/api/server/updateGeofile 2>/dev/null | jq -e '.success' >/dev/null 2>&1; then
+    ok "geodata обновлена"
+  else
+    warn "geodata: панель вернула ошибку — не обновилось (не критично, правила продолжают работать)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Проверка совместимости ядра с ЖИВЫМ конфигом.
+# Xray сначала помечает функции устаревшими, а потом удаляет — и тогда конфиг
+# с ними перестаёт загружаться, ядро не стартует, падают ВСЕ инбаунды.
+# `xray run -test` строит конфиг целиком, но порты не занимает — поэтому его
+# можно гонять рядом с работающим xray. Запускаем ровно как x-ui:
+# cwd=/usr/local/x-ui, `-c bin/config.json`, geodata из bin/.
+# ---------------------------------------------------------------------------
+_latest_tag() {
+  local t
+  t=$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$XRAY_REPO/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)
+  # API для анонимов ограничен 60 запросами/час на IP — запасной путь через редирект
+  [[ -n $t ]] || t=$(curl -fsSI --max-time 20 "https://github.com/$XRAY_REPO/releases/latest" 2>/dev/null \
+                      | awk -F/ 'tolower($1) ~ /^location:/{print $NF}' | tr -d '\r' || true)
+  [[ $t =~ ^v[0-9]+(\.[0-9]+)+$ ]] && printf '%s' "$t"
+}
+
+_xray_asset() {
+  case "$(uname -m)" in
+    x86_64 | amd64)  echo Xray-linux-64.zip ;;
+    aarch64 | arm64) echo Xray-linux-arm64-v8a.zip ;;
+    *) return 1 ;;
+  esac
+}
+
+# _xray_fetch TAG DIR — скачивает релиз и печатает путь к бинарнику.
+_xray_fetch() {
+  local tag=$1 dir=$2 asset
+  asset=$(_xray_asset) || { warn "проверка: архитектура $(uname -m) не поддерживается"; return 1; }
+  curl -fsSL --max-time 180 -o "$dir/xray.zip" \
+       "https://github.com/$XRAY_REPO/releases/download/$tag/$asset" 2>/dev/null \
+    || { warn "проверка: не скачал $asset ($tag)"; return 1; }
+  python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("xray", sys.argv[2])' \
+       "$dir/xray.zip" "$dir" 2>/dev/null || { warn "проверка: архив $asset повреждён"; return 1; }
+  chmod +x "$dir/xray"; printf '%s' "$dir/xray"
+}
+
+# _xray_compat BIN — 0, если ядро BIN принимает живой конфиг панели.
+# Печатает итог и найденные предупреждения об устаревших функциях.
+_xray_compat() {
+  local bin=$1 out rc=0 cfg
+  [[ -r $XUI_DIR/bin/config.json ]] || { warn "нет $XUI_DIR/bin/config.json — проверять нечего"; return 2; }
+  # копия конфига с loglevel=warning (чтобы увидеть предупреждения, даже если в
+  # панели стоит error/none) и без access-лога; суффикс .json обязателен для Xray
+  cfg=$(mktemp --suffix=.json "${TMPDIR:-/tmp}/xui-compat-XXXXXX")
+  jq '.log = ((.log // {}) + {loglevel: "warning", access: "none"})' "$XUI_DIR/bin/config.json" >"$cfg" 2>/dev/null \
+    || cp "$XUI_DIR/bin/config.json" "$cfg"
+  # Xray пишет предупреждения асинхронно, а -test сразу делает os.Exit — изредка
+  # (~1 из 20 запусков) часть предупреждений теряется. Итог OK/ошибка печатается
+  # синхронно и надёжен; предупреждения собираем с трёх прогонов.
+  local i o r443=0 n
+  for i in 1 2 3; do
+    rc=0; o=$(cd "$XUI_DIR" && XRAY_LOCATION_ASSET="$XUI_DIR/bin" "$bin" run -test -c "$cfg" 2>&1) || rc=$?
+    out+=$'\n'"$o"
+    n=$(grep -c 'REALITY: Listening on non-443' <<<"$o" || true); (( n > r443 )) && r443=$n
+  done
+  rm -f "$cfg"
+  if [[ $rc == 0 && $out == *"Configuration OK"* ]]; then
+    printf '  %s\n' "конфиг загружается ✔"
+  else
+    printf '  %s\n' "конфиг НЕ загружается ✘"
+    grep -E 'Failed to start|failed to|removed|error' <<<"$out" | sort -u | head -n 3 | sed 's/^/    /'
+  fi
+  grep -E 'is deprecated|will be removed|has been removed' <<<"$out" \
+    | sed -E 's/^.*(The feature|This feature|The ")/\1/; s/ Please .*$//' | sort -u | sed 's/^/    ⚠ /' || true
+  (( r443 > 0 )) && printf '    ⚠ REALITY не на 443: %s шт. (выше риск блокировки)\n' "$r443"
+  [[ $rc == 0 && $out == *"Configuration OK"* ]]
+}
+
+_current_xray_bin() {
+  local b; b=$(ls "$XUI_DIR"/bin/xray-linux-* 2>/dev/null | head -n1)
+  [[ -n $b && -x $b ]] && printf '%s' "$b"
+}
+
+cmd_check() {
+  local tag=${1:-} tmp bin cur
+  cur=$(xui_xray_version); cur=${cur:-?}
+  if bin=$(_current_xray_bin); then
+    echo "Текущее ядро $cur:"; _xray_compat "$bin" || true
+  fi
+  [[ -n $tag ]] || tag=$(_latest_tag) || true
+  [[ -n $tag ]] || { warn "не узнал последнюю версию Xray (GitHub недоступен)"; return 1; }
+  if [[ ${tag#v} == "$cur" ]]; then ok "Последний релиз $tag уже установлен"; return 0; fi
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+  bin=$(_xray_fetch "$tag" "$tmp") || return 1
+  echo "Релиз $tag ($("$bin" version 2>/dev/null | awk 'NR==1{print $2}')):"
+  if _xray_compat "$bin"; then
+    ok "Ядро $tag примет текущий конфиг — обновляться можно: xui-update core"
+  else
+    warn "Ядро $tag НЕ примет текущий конфиг — НЕ обновляйся, пока не уберёшь функции выше"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# core — обновление ядра. Порядок: проверка нового ядра на живом конфиге →
+# установка через панель → контроль запуска → откат при падении.
+# Ограничение: проверки ловят «ядро не стартует», но не ловят «ядро работает,
+# а часть клиентов молча не коннектится» (как с Reality в 26.9.x). Поэтому
+# таймер по умолчанию выключен (AUTO_UPDATE_CORE=0).
+# ---------------------------------------------------------------------------
+_xray_state() { api GET panel/api/server/status 2>/dev/null | jq -r '.obj.xray.state // empty' 2>/dev/null || true; }
+
+# xray запущен как дочерний процесс x-ui: `bin/xray-linux-amd64 -c bin/config.json`
+_xray_child_alive() {
+  local p; p=$(systemctl show -p MainPID --value x-ui 2>/dev/null || echo 0)
+  [[ ${p:-0} -gt 0 ]] && pgrep -P "$p" -f 'xray' >/dev/null 2>&1
+}
+
+# _xray_up — ждёт до ~40 с. Пустой ответ API (сбой связи/токена) — повод
+# переподключиться и посмотреть на процесс, а не откатывать рабочее ядро.
+_xray_up() {
+  local i st
+  for i in 1 2 3 4 5 6 7 8; do
+    st=$(_xray_state)
+    [[ $st == running ]] && return 0
+    if [[ -z $st ]]; then
+      BASE=''; _need_api >/dev/null 2>&1 || true
+      if [[ $i -ge 3 ]] && _xray_child_alive; then return 0; fi
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+update_core() {
+  _need_api || return 0
+  local cur latest latest_num
+  cur=$(xui_xray_version); [[ -n $cur ]] || cur='?'
+  latest=$(_latest_tag || true)
+  [[ -n $latest ]] || { warn "core: не удалось узнать последнюю версию Xray (GitHub недоступен) — пропускаю"; return 0; }
+  latest_num="${latest#v}"
+
+  if [[ "$cur" == "$latest_num" ]]; then
+    ok "Xray уже последней версии ($cur) — обновление не требуется"; return 0
+  fi
+  # защита от даунгрейда (pre-release/битый тег)
+  if [[ $cur != '?' ]]; then
+    local newest; newest=$(printf '%s\n%s\n' "$cur" "$latest_num" | sort -V | tail -1)
+    [[ "$newest" == "$latest_num" ]] || { info "Текущая версия Xray ($cur) не старше релиза ($latest_num) — пропускаю"; return 0; }
+  fi
+
+  # предварительная проверка: новое ядро должно принять текущий конфиг
+  local tmp bin; tmp=$(mktemp -d)
+  if ! bin=$(_xray_fetch "$latest" "$tmp"); then
+    rm -rf "$tmp"; warn "core: не смог проверить $latest заранее — не обновляю"; return 0
+  fi
+  echo "Проверка $latest на текущем конфиге:" >&2
+  if ! _xray_compat "$bin" >&2; then
+    rm -rf "$tmp"
+    warn "core: $latest НЕ принимает текущий конфиг — обновление ОТМЕНЕНО, ядро $cur продолжает работать"
+    return 1
+  fi
+  rm -rf "$tmp"
+
+  info "Обновляю ядро Xray: ${cur} → ${latest_num} …"
+  if ! api POST "panel/api/server/installXray/$latest" 2>/dev/null | jq -e '.success' >/dev/null 2>&1; then
+    warn "core: установка $latest не удалась (API) — версия ядра не изменена"; return 0
+  fi
+  if _xray_up; then ok "Xray обновлён до $(xui_xray_version) и работает"; return 0; fi
+
+  warn "Xray $latest_num не поднялся — ОТКАТ на $cur"
+  if [[ $cur == '?' ]]; then
+    warn "Откат невозможен (прежняя версия неизвестна). Панель → выбери рабочую версию Xray"; return 1
+  fi
+  if api POST "panel/api/server/installXray/v$cur" 2>/dev/null | jq -e '.success' >/dev/null 2>&1 && _xray_up; then
+    ok "Откат выполнен — Xray снова $cur и работает"; return 0
+  fi
+  warn "Откат не поднял ядро. Вручную: x-ui restart; journalctl -u x-ui -n 50"
+  return 1
+}
+
+case "${1:-all}" in
+  geodata) update_geodata ;;
+  check)   cmd_check "${2:-}" ;;
+  core)    update_core ;;
+  all)     update_geodata || true; update_core ;;
+  *) echo "usage: xui-update {geodata|check [vX.Y.Z]|core|all}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,11 @@
+[Unit]
+Description=xui-bootstrap WARP health check (verified IP/endpoint switch)
+After=x-ui.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xui-warp health
+Nice=10
+# подбор эндпоинтов + до двух кандидатов укладываются с запасом
+TimeoutStartSec=10min
