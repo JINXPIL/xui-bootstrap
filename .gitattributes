@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.env text eol=lf
+*.json text eol=lf
+*.nft text eol=lf
+*.example text eol=lf
+bin/xui-fw-sync text eol=lf
