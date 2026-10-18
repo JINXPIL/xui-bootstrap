@@ -1,0 +1,28 @@
+{
+  "remark": "VLESS-Reality-Vision",
+  "enable": true,
+  "listen": "",
+  "port": 443,
+  "protocol": "vless",
+  "settings": {
+    "decryption": "none",
+    "fallbacks": [],
+    "clients": [
+      { "id": "__UUID__", "email": "__EMAIL__", "flow": "xtls-rprx-vision", "enable": true }
+    ]
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "xver": 0,
+      "target": "__DEST__",
+      "serverNames": ["__SNI__"],
+      "privateKey": "__PRIVATE_KEY__",
+      "shortIds": ["__SHORT_ID__"],
+      "settings": { "publicKey": "__PUBLIC_KEY__", "fingerprint": "chrome", "spiderX": "/" }
+    }
+  },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true }
+}
