@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  xui-warp — WARP-выход для Gemini/Google AI в xui-bootstrap.
+#
+#    health        проверка (таймер, раз в 6 ч). Меняет конфиг и перезапускает
+#                  x-ui ТОЛЬКО если нашёлся проверенно рабочий вариант.
+#    diag          подробная диагностика, ничего не меняет.
+#    rotate        принудительная смена IP (тоже с проверкой кандидата).
+#    register      новая регистрация WARP без применения к панели.
+#    use-svc [P]   гнать Gemini через официальный клиент Cloudflare
+#                  (warp-svc в proxy-режиме, socks 127.0.0.1:P, по умолч. 40000).
+#    use-wg        вернуться на встроенный WireGuard-WARP.
+# ============================================================================
+set -Eeuo pipefail
+
+LIB=/usr/local/share/xui-bootstrap/lib
+for m in common keys xui warp; do
+  # shellcheck source=/dev/null
+  [[ -r "$LIB/$m.sh" ]] && . "$LIB/$m.sh"
+done
+command -v warp_health >/dev/null 2>&1 || { echo "xui-warp: библиотеки не установлены ($LIB)" >&2; exit 1; }
+
+_mode() { [[ -n $(warp_env_get WARP_SOCKS) ]] && echo svc || echo wg; }
+_explain() {
+  case "$1" in
+    0) echo "OK: туннель жив, Google отвечает" ;;
+    1) echo "туннель жив, но Google не отвечает/блокирует" ;;
+    3) echo "туннель WARP НЕ поднимается" ;;
+    *) echo "проверить не удалось" ;;
+  esac
+}
+
+cmd_health() {
+  systemctl is-active --quiet x-ui || { warn "WARP: x-ui не запущен — проверку пропускаю"; return 0; }
+  local rc=0
+  warp_health || rc=$?
+  case $rc in
+    0)
+      ok "WARP: $(_explain 0) (выход: ${WARP_EGRESS:-?})"; return 0 ;;
+    2)
+      warn "WARP: $(_explain 2): ${WARP_HEALTH_DETAIL:-}"; return 0 ;;
+  esac
+
+  if [[ $(_mode) == svc ]]; then
+    # warp-svc сам управляет регистрацией и IP — менять тут нечего.
+    warn "WARP (warp-svc): $(_explain "$rc"). Проверь: warp-cli --accept-tos status"
+    return 1
+  fi
+
+  if [[ $rc == 3 ]]; then
+    warn "WARP: $(_explain 3): ${WARP_HEALTH_DETAIL:-}"
+    info "Смена IP тут не поможет — подбираю порт эндпоинта…"
+    local ep
+    if ep=$(warp_find_endpoint); then
+      warp_env_set WARP_ENDPOINT "$ep"
+      if warp_swap_in_template; then ok "WARP: туннель поднялся на $ep — применено"; return 0; fi
+      warn "WARP: эндпоинт $ep рабочий, но шаблон панели обновить не удалось"; return 1
+    fi
+    warn "WARP: ни один эндпоинт не ответил. Панель НЕ перезапускаю."
+    warn "Вероятно, хостер режет UDP до Cloudflare. Варианты: 'xui-warp diag', 'xui-warp use-svc'."
+    return 1
+  fi
+
+  # rc == 1: туннель жив, Google не отвечает → пробуем другой IP с проверкой
+  warn "WARP: $(_explain 1) (${WARP_HEALTH_DETAIL:-}, выход ${WARP_EGRESS:-?}) — ищу другой IP"
+  if warp_rotate_verified 2; then
+    ok "WARP: IP заменён на проверенно рабочий"
+    return 0
+  fi
+  warn "WARP: рабочий кандидат не найден — оставляю текущий, панель не перезапускаю"
+  return 1
+}
+
+cmd_diag() {
+  local rc ep
+  echo "== Система =="
+  echo "  DNS хоста: $(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null | paste -sd' ' -)"
+  if systemctl is-active --quiet warp-svc 2>/dev/null; then
+    echo "  warp-svc (официальный клиент Cloudflare): АКТИВЕН"
+    if command -v warp-cli >/dev/null 2>&1; then
+      warp-cli --accept-tos status 2>/dev/null | sed 's/^/    /' | head -6 || true
+    fi
+    ss -Hltnp 2>/dev/null | grep -i warp | awk '{print "    слушает: " $4}' || true
+  else
+    echo "  warp-svc: не активен / не установлен"
+  fi
+  echo "  Прямой выход VPS: $(curl -s --max-time 10 "$WARP_TRACE_URL" 2>/dev/null | awk -F= '$1~/^(ip|colo|warp)$/{printf "%s=%s ", $1, $2}')"
+  echo "    (warp=on здесь = ВЕСЬ трафик сервера уже идёт через warp-svc)"
+  echo "  Google напрямую: HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$WARP_PROBE_URL" 2>/dev/null || true)"
+
+  echo "== WARP xui-bootstrap ($WARP_ENV) =="
+  echo "  режим: $(_mode)   эндпоинт: $(warp_env_get WARP_ENDPOINT)   socks: $(warp_env_get WARP_SOCKS)"
+  rc=0; warp_health || rc=$?
+  echo "  текущий: $(_explain "$rc") | ${WARP_HEALTH_DETAIL:-} | выход: ${WARP_EGRESS:-—}"
+
+  if [[ $(_mode) == wg && $rc != 0 && $rc != 2 ]]; then
+    echo "== Скан эндпоинтов (те же ключи, разные порты) =="
+    for ep in $WARP_FALLBACK_ENDPOINTS; do
+      rc=0; WARP_ENDPOINT_OVERRIDE=$ep warp_health || rc=$?
+      printf '  %-22s %s\n' "$ep" "$(_explain "$rc")"
+    done
+  fi
+  echo "Ничего не изменено."
+}
+
+cmd_use_svc() {
+  local p=${1:-40000} trace
+  [[ $p =~ ^[0-9]+$ ]] || { warn "порт должен быть числом"; return 2; }
+  trace=$(curl -s --max-time 12 --socks5-hostname "127.0.0.1:$p" "$WARP_TRACE_URL" 2>/dev/null || true)
+  if ! grep -qE '^warp=(on|plus)$' <<<"$trace"; then
+    warn "На 127.0.0.1:$p нет рабочего WARP-прокси. Переведи warp-svc в proxy-режим:"
+    warn "  warp-cli --accept-tos mode proxy && warp-cli --accept-tos proxy port $p && warp-cli --accept-tos connect"
+    return 1
+  fi
+  warp_env_set WARP_SOCKS "127.0.0.1:$p"
+  warp_swap_in_template || { warn "не обновил шаблон панели"; return 1; }
+  ok "Gemini/Google AI теперь идут через warp-svc (выход: $(awk -F= '$1=="ip"{print $2}' <<<"$trace"))"
+}
+
+cmd_use_wg() {
+  warp_env_del WARP_SOCKS
+  if [[ -z $(warp_env_get WARP_PRIV) ]]; then
+    warp_register || { warn "WARP: регистрация не удалась"; return 1; }
+  fi
+  warp_swap_in_template && ok "WARP: снова встроенный WireGuard"
+}
+
+case "${1:-health}" in
+  health)   cmd_health ;;
+  diag)     cmd_diag ;;
+  rotate)
+    [[ $(_mode) == wg ]] || { warn "режим warp-svc: IP меняет сам клиент Cloudflare"; exit 1; }
+    warp_rotate_verified 3 && ok "WARP: IP сменён (кандидат проверен)" || { warn "WARP: рабочий кандидат не найден, оставлен текущий"; exit 1; } ;;
+  register)
+    warp_register && ok "WARP: регистрация выполнена ($WARP_ENV)" || { warn "WARP: регистрация не удалась"; exit 1; } ;;
+  use-svc)  cmd_use_svc "${2:-}" ;;
+  use-wg)   cmd_use_wg ;;
+  *) echo "usage: xui-warp {health|diag|rotate|register|use-svc [PORT]|use-wg}" >&2; exit 2 ;;
+esac
